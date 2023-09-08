@@ -5374,6 +5374,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "toml 0.7.6",
 ]
 
 [[package]]
@@ -6343,6 +6344,17 @@ name = "route-recognizer"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "afab94fb28594581f62d981211a9a4d53cc8130bbcbbb89a0440d9b8e81a7746"
+
+[[package]]
+name = "rpc-db"
+version = "0.0.0"
+dependencies = [
+ "eyre",
+ "futures",
+ "jsonrpsee",
+ "reth",
+ "tokio",
+]
 
 [[package]]
 name = "ruint"
