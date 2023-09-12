@@ -4,7 +4,7 @@ use crate::{
 };
 use num_traits::Zero;
 use reth_db::{
-    cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO},
+    cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW},
     database::Database,
     models::BlockNumberAddress,
     tables,
@@ -15,11 +15,11 @@ use reth_primitives::{
     stage::{
         CheckpointBlockRange, EntitiesCheckpoint, ExecutionCheckpoint, StageCheckpoint, StageId,
     },
-    BlockNumber, Header, PruneModes, U256,
+    BlockNumber, Header, PruneModes, StorageEntry, U256,
 };
 use reth_provider::{
-    BlockReader, DatabaseProviderRW, ExecutorFactory, HeaderProvider, LatestStateProviderRef,
-    OriginalValuesKnown, ProviderError,
+    BlockReader, BundleStateWithReceipts, DatabaseProviderRW, ExecutorFactory, HeaderProvider,
+    LatestStateProviderRef, OriginalValuesKnown, ProviderError, StateReverts,
 };
 use std::{
     ops::RangeInclusive,
@@ -70,6 +70,8 @@ pub struct ExecutionStage<EF: ExecutorFactory> {
     external_clean_threshold: u64,
     /// Pruning configuration.
     prune_modes: PruneModes,
+    /// State to write
+    state_to_write: Option<(Vec<(BlockNumberAddress, StorageEntry)>, ExecOutput)>,
 }
 
 impl<EF: ExecutorFactory> ExecutionStage<EF> {
@@ -86,6 +88,7 @@ impl<EF: ExecutorFactory> ExecutionStage<EF> {
             executor_factory,
             thresholds,
             prune_modes,
+            state_to_write: None,
         }
     }
 
@@ -113,8 +116,29 @@ impl<EF: ExecutorFactory> ExecutionStage<EF> {
         provider: &DatabaseProviderRW<'_, &DB>,
         input: ExecInput,
     ) -> Result<ExecOutput, StageError> {
+        if let Some((state, output)) = self.state_to_write.take() {
+            info!(target: "sync::stages::execution", "WRITE STATE TO DB");
+            //executor.stats().log_info();
+            //drop(executor);
+            // write output
+            //let time = Instant::now();
+            let mut storage_changeset_cursor =
+                provider.tx_ref().cursor_dup_write::<tables::StorageChangeSet>()?;
+            info!(target: "sync::stages::execution", "state len {}", state.len());
+            for (entry_key, entry_value) in state {
+                storage_changeset_cursor.append_dup(entry_key, entry_value)?;
+            }
+            //state.write_to_db(provider.tx_ref(), OriginalValuesKnown::Yes)?;
+            //let db_write_duration = time.elapsed();
+
+            //info!(target: "sync::stages::execution", block_fetch=?fetch_block_duration, execution=?execution_duration,
+            //    write=?db_write_duration, " Execution duration.");
+
+            return Ok(output);
+        }
+
         if input.target_reached() {
-            return Ok(ExecOutput::done(input.checkpoint()))
+            return Ok(ExecOutput::done(input.checkpoint()));
         }
 
         let start_block = input.next_block();
@@ -176,25 +200,28 @@ impl<EF: ExecutorFactory> ExecutionStage<EF> {
 
             // Check if we should commit now
             if self.thresholds.is_end_of_batch(block_number - start_block, 0, cumulative_gas) {
-                break
+                break;
             }
         }
-        let state = executor.take_output_state();
-        executor.stats().log_info();
-        drop(executor);
-
-        let time = Instant::now();
-        // write output
-        state.write_to_db(provider.tx_ref(), OriginalValuesKnown::Yes)?;
-        let db_write_duration = time.elapsed();
-        info!(target: "sync::stages::execution", block_fetch=?fetch_block_duration, execution=?execution_duration, 
-            write=?db_write_duration, " Execution duration.");
 
         let done = stage_progress == max_block;
-        Ok(ExecOutput {
+        let output = ExecOutput {
             checkpoint: StageCheckpoint::new(stage_progress)
                 .with_execution_stage_checkpoint(stage_checkpoint),
             done,
+        };
+
+        let mut bundle = executor.take_output_state();
+        let mut state = bundle.take_state();
+        let prepared_reverts = StateReverts(state.take_all_reverts().into_plain_state_reverts())
+            .wrapper(provider.tx_ref(), bundle.first_block())?;
+
+        self.state_to_write = Some((prepared_reverts, output));
+
+        Ok(ExecOutput {
+            checkpoint: StageCheckpoint::new(start_block)
+                .with_execution_stage_checkpoint(stage_checkpoint),
+            done: false,
         })
     }
 
@@ -218,8 +245,8 @@ impl<EF: ExecutorFactory> ExecutionStage<EF> {
 
         // If we're not executing MerkleStage from scratch (by threshold or first-sync), then erase
         // changeset related pruning configurations
-        if !(max_block - start_block > self.external_clean_threshold ||
-            provider.tx_ref().entries::<tables::AccountsTrie>()?.is_zero())
+        if !(max_block - start_block > self.external_clean_threshold
+            || provider.tx_ref().entries::<tables::AccountsTrie>()?.is_zero())
         {
             prune_modes.account_history = None;
             prune_modes.storage_history = None;
@@ -287,8 +314,8 @@ fn execution_checkpoint<DB: Database>(
                 block_range: CheckpointBlockRange { from: start_block, to: max_block },
                 progress: EntitiesCheckpoint {
                     processed,
-                    total: processed +
-                        calculate_gas_used_from_headers(provider, start_block..=max_block)?,
+                    total: processed
+                        + calculate_gas_used_from_headers(provider, start_block..=max_block)?,
                 },
             }
         }
@@ -342,16 +369,20 @@ impl<EF: ExecutorFactory, DB: Database> Stage<DB> for ExecutionStage<EF> {
         // to optimize revm or move data to the heap.
         //
         // See https://github.com/bluealloy/revm/issues/305
-        std::thread::scope(|scope| {
-            let handle = std::thread::Builder::new()
-                .stack_size(BIG_STACK_SIZE)
-                .spawn_scoped(scope, || {
-                    // execute and store output to results
-                    self.execute_inner(provider, input)
-                })
-                .expect("Expects that thread name is not null");
-            handle.join().expect("Expects for thread to not panic")
-        })
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        self.execute_inner(provider, input)
+        // std::thread::scope(|scope| {
+        //     let handle = std::thread::Builder::new()
+        //         .stack_size(BIG_STACK_SIZE)
+        //         .spawn_scoped(scope, || {
+        //             // execute and store output to results
+
+        //             tokio::time::sleep(Duration::from_secs(5)).await;
+        //             self.execute_inner(provider, input)
+        //         })
+        //         .expect("Expects that thread name is not null");
+        //     handle.join().expect("Expects for thread to not panic")
+        // })
     }
 
     /// Unwind the stage.
@@ -371,7 +402,7 @@ impl<EF: ExecutorFactory, DB: Database> Stage<DB> for ExecutionStage<EF> {
         if range.is_empty() {
             return Ok(UnwindOutput {
                 checkpoint: input.checkpoint.with_block_number(input.unwind_to),
-            })
+            });
         }
 
         // get all batches for account change
@@ -414,7 +445,7 @@ impl<EF: ExecutorFactory, DB: Database> Stage<DB> for ExecutionStage<EF> {
         let mut rev_storage_changeset_walker = storage_changeset.walk_back(None)?;
         while let Some((key, _)) = rev_storage_changeset_walker.next().transpose()? {
             if key.block_number() < *range.start() {
-                break
+                break;
             }
             // delete all changesets
             rev_storage_changeset_walker.delete_current()?;
@@ -434,7 +465,7 @@ impl<EF: ExecutorFactory, DB: Database> Stage<DB> for ExecutionStage<EF> {
 
         while let Some(Ok((tx_number, receipt))) = reverse_walker.next() {
             if tx_number < first_tx_num {
-                break
+                break;
             }
             reverse_walker.delete_current()?;
 
@@ -490,9 +521,9 @@ impl ExecutionStageThresholds {
         changes_processed: u64,
         cumulative_gas_used: u64,
     ) -> bool {
-        blocks_processed >= self.max_blocks.unwrap_or(u64::MAX) ||
-            changes_processed >= self.max_changes.unwrap_or(u64::MAX) ||
-            cumulative_gas_used >= self.max_cumulative_gas.unwrap_or(u64::MAX)
+        blocks_processed >= self.max_blocks.unwrap_or(u64::MAX)
+            || changes_processed >= self.max_changes.unwrap_or(u64::MAX)
+            || cumulative_gas_used >= self.max_cumulative_gas.unwrap_or(u64::MAX)
     }
 }
 

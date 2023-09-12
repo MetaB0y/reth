@@ -1,5 +1,5 @@
 //! Wrapper around revms state.
-use itertools::Itertools;
+use itertools::{enumerate, Itertools};
 use reth_db::{
     cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW},
     models::{AccountBeforeTx, BlockNumberAddress},
@@ -95,6 +95,11 @@ impl BundleStateWithReceipts {
         );
 
         Self { bundle, receipts, first_block }
+    }
+
+    /// Take the bundle state.
+    pub fn take_state(&mut self) -> BundleState {
+        std::mem::take(&mut self.bundle)
     }
 
     /// Return revm bundle state.
@@ -219,11 +224,11 @@ impl BundleStateWithReceipts {
     /// Transform block number to the index of block.
     fn block_number_to_index(&self, block_number: BlockNumber) -> Option<usize> {
         if self.first_block > block_number {
-            return None
+            return None;
         }
         let index = block_number - self.first_block;
         if index >= self.receipts.len() as u64 {
-            return None
+            return None;
         }
         Some(index as usize)
     }
@@ -310,10 +315,10 @@ impl BundleStateWithReceipts {
         let last_block = self.last_block();
         let first_block = self.first_block;
         if block_number >= last_block {
-            return None
+            return None;
         }
         if block_number < first_block {
-            return Some(Self::default())
+            return Some(Self::default());
         }
 
         // detached number should be included so we are adding +1 to it.
@@ -359,24 +364,24 @@ impl BundleStateWithReceipts {
 
         StateReverts(reverts).write_to_db(tx, self.first_block)?;
 
-        StateChange(plain_state).write_to_db(tx)?;
+        // StateChange(plain_state).write_to_db(tx)?;
 
-        // write receipts
-        let mut bodies_cursor = tx.cursor_read::<tables::BlockBodyIndices>()?;
-        let mut receipts_cursor = tx.cursor_write::<tables::Receipts>()?;
+        // // write receipts
+        // let mut bodies_cursor = tx.cursor_read::<tables::BlockBodyIndices>()?;
+        // let mut receipts_cursor = tx.cursor_write::<tables::Receipts>()?;
 
-        for (idx, receipts) in self.receipts.into_iter().enumerate() {
-            if !receipts.is_empty() {
-                let (_, body_indices) = bodies_cursor
-                    .seek_exact(self.first_block + idx as u64)?
-                    .expect("body indices exist");
+        // for (idx, receipts) in self.receipts.into_iter().enumerate() {
+        //     if !receipts.is_empty() {
+        //         let (_, body_indices) = bodies_cursor
+        //             .seek_exact(self.first_block + idx as u64)?
+        //             .expect("body indices exist");
 
-                let first_tx_index = body_indices.first_tx_num();
-                for (tx_idx, receipt) in receipts.into_iter().sorted_by_key(|(idx, _)| *idx) {
-                    receipts_cursor.append(first_tx_index + tx_idx as u64, receipt)?;
-                }
-            }
-        }
+        //         let first_tx_index = body_indices.first_tx_num();
+        //         for (tx_idx, receipt) in receipts.into_iter().sorted_by_key(|(idx, _)| *idx) {
+        //             receipts_cursor.append(first_tx_index + tx_idx as u64, receipt)?;
+        //         }
+        //     }
+        // }
 
         Ok(())
     }
@@ -393,31 +398,55 @@ impl From<PlainStateReverts> for StateReverts {
 }
 
 impl StateReverts {
-    /// Write reverts to database.
-    ///
-    /// Note:: Reverts will delete all wiped storage from plain state.
-    pub fn write_to_db<'a, TX: DbTxMut<'a> + DbTx<'a>>(
-        self,
+
+    #[inline(never)]
+    pub fn wrapper<'a, TX: DbTxMut<'a> + DbTx<'a>>(
+        mut self,
         tx: &TX,
         first_block: BlockNumber,
-    ) -> Result<(), DatabaseError> {
-        // Write storage changes
-        tracing::trace!(target: "provider::reverts", "Writing storage changes");
-        let mut storages_cursor = tx.cursor_dup_write::<tables::PlainStorageState>()?;
-        let mut storage_changeset_cursor = tx.cursor_dup_write::<tables::StorageChangeSet>()?;
-        for (block_number, storage_changes) in self.0.storage.into_iter().enumerate() {
-            let block_number = first_block + block_number as BlockNumber;
+    ) -> Result<Vec<(BlockNumberAddress,StorageEntry)>, DatabaseError> {
+        let mut output = {
+            // Transmute the  reverts so they are more packed.
+            std::mem::take(&mut self.0.accounts);
+            // let accounts = self
+            //     .0
+            //     .accounts
+            //     .into_iter()
+            //     .enumerate()
+            //     .flat_map(|(num, revert)| {
+            //         revert.into_iter().map(move |b| (num as u64 + first_block, b))
+            //     })
+            //     .collect::<Vec<_>>();
+            let storage = self
+                .0
+                .storage
+                .into_iter()
+                .enumerate()
+                .flat_map(|(num, reverts)| {
+                    reverts.into_iter().map(move |b| (num as u64 + first_block, b))
+                })
+                .collect::<Vec<_>>();
+            //let reverts
 
-            tracing::trace!(target: "provider::reverts", block_number=block_number,"Writing block change");
-            for PlainStorageRevert { address, wiped, storage_revert } in storage_changes.into_iter()
-            {
+            // Write storage changes
+            tracing::trace!(target: "provider::reverts", "Writing storage changes");
+            let mut storages_cursor = tx.cursor_dup_read::<tables::PlainStorageState>()?;
+            let mut wiped_storage: Vec<(U256, U256)> = Vec::with_capacity(10000);
+            let mut output = Vec::new();
+            for (block_number, PlainStorageRevert { address, wiped, storage_revert }) in storage {
+                //for (block_number, storage_changes) in storage {
+                //let block_number = first_block + block_number as BlockNumber;
+
+                // tracing::trace!(target: "provider::reverts", block_number=block_number,"Writing block change");
+                // for PlainStorageRevert { address, wiped, storage_revert } in storage_changes.into_iter()
+                // {
                 let storage = storage_revert;
                 let storage_id = BlockNumberAddress((block_number, address));
                 tracing::trace!(target: "provider::reverts","Writting revert for {:?}", address);
                 // If we are writing the primary storage wipe transition, the pre-existing plain
                 // storage state has to be taken from the database and written to storage history.
                 // See [StorageWipe::Primary] for more details.
-                let mut wiped_storage: Vec<(U256, U256)> = Vec::new();
+                wiped_storage.clear();
                 if wiped {
                     tracing::trace!(target: "provider::reverts", "wipe storage storage changes");
                     if let Some((_, entry)) = storages_cursor.seek_exact(address)? {
@@ -431,29 +460,36 @@ impl StateReverts {
                 // if empty just write storage reverts.
                 if wiped_storage.is_empty() {
                     for (slot, old_value) in storage {
-                        storage_changeset_cursor.append_dup(
+                        // storage_changeset_cursor.append_dup(
+                        //     storage_id,
+                        //     StorageEntry {
+                        //         key: H256(slot.to_be_bytes()),
+                        //         value: old_value.to_previous_value(),
+                        //     },
+                        // )?;
+                        output.push((
                             storage_id,
                             StorageEntry {
                                 key: H256(slot.to_be_bytes()),
                                 value: old_value.to_previous_value(),
                             },
-                        )?;
+                        ));
                     }
                 } else {
                     // if there is some of wiped storage, they are both sorted, intersect both of
                     // them and in conflict use change from revert (discard values from wiped
                     // storage).
-                    let mut wiped_iter = wiped_storage.into_iter();
+                    let mut wiped_iter = wiped_storage.iter();
                     let mut revert_iter = storage.into_iter();
 
                     // items to apply. both iterators are sorted.
-                    let mut wiped_item = wiped_iter.next();
+                    let mut wiped_item = wiped_iter.next().cloned();
                     let mut revert_item = revert_iter.next();
                     loop {
                         let apply = match (wiped_item, revert_item) {
                             (None, None) => break,
                             (Some(w), None) => {
-                                wiped_item = wiped_iter.next();
+                                wiped_item = wiped_iter.next().cloned();
                                 w
                             }
                             (None, Some(r)) => {
@@ -464,7 +500,7 @@ impl StateReverts {
                                 match w.0.cmp(&r.0) {
                                     std::cmp::Ordering::Less => {
                                         // next key is from revert storage
-                                        wiped_item = wiped_iter.next();
+                                        wiped_item = wiped_iter.next().cloned();
                                         w
                                     }
                                     std::cmp::Ordering::Greater => {
@@ -474,7 +510,7 @@ impl StateReverts {
                                     }
                                     std::cmp::Ordering::Equal => {
                                         // priority goes for storage if key is same.
-                                        wiped_item = wiped_iter.next();
+                                        wiped_item = wiped_iter.next().cloned();
                                         revert_item = revert_iter.next();
 
                                         // If storage slot is RevertToSlot::Some, the storage
@@ -492,27 +528,55 @@ impl StateReverts {
                             }
                         };
 
-                        storage_changeset_cursor.append_dup(
+                        // storage_changeset_cursor.append_dup(
+                        //     storage_id,
+                        //     StorageEntry { key: H256(apply.0.to_be_bytes()), value: apply.1 },
+                        // )?;
+                        output.push((
                             storage_id,
                             StorageEntry { key: H256(apply.0.to_be_bytes()), value: apply.1 },
-                        )?;
+                        ));
                     }
                 }
+                //}
             }
+            output
+        };
+
+
+        Ok(output)
+    }
+    /// Write reverts to database.
+    ///
+    /// Note:: Reverts will delete all wiped storage from plain state.
+    pub fn write_to_db<'a, TX: DbTxMut<'a> + DbTx<'a>>(
+        mut self,
+        tx: &TX,
+        first_block: BlockNumber,
+    ) -> Result<(), DatabaseError> {
+        let output = self.wrapper(tx, first_block)?;
+
+        // flush all to db
+        let mut storage_changeset_cursor = tx.cursor_dup_write::<tables::StorageChangeSet>()?;
+        for (entry_key, entry_value) in output {
+            storage_changeset_cursor.append_dup(entry_key, entry_value)?;
         }
 
+        // Write everything;
+
         // Write account changes
-        tracing::trace!(target: "provider::reverts", "Writing account changes");
-        let mut account_changeset_cursor = tx.cursor_dup_write::<tables::AccountChangeSet>()?;
-        for (block_number, account_block_reverts) in self.0.accounts.into_iter().enumerate() {
-            let block_number = first_block + block_number as BlockNumber;
-            for (address, info) in account_block_reverts {
-                account_changeset_cursor.append_dup(
-                    block_number,
-                    AccountBeforeTx { address, info: info.map(into_reth_acc) },
-                )?;
-            }
-        }
+        // tracing::trace!(target: "provider::reverts", "Writing account changes");
+        // let mut account_changeset_cursor = tx.cursor_dup_write::<tables::AccountChangeSet>()?;
+        // for (block_number, (address, info)) in accounts {
+        //     //for (block_number, account_block_reverts) in self.0.accounts.into_iter().enumerate() {
+        //     //let block_number = first_block + block_number as BlockNumber;
+        //     //for (address, info) in account_block_reverts {
+        //     account_changeset_cursor.append_dup(
+        //         block_number,
+        //         AccountBeforeTx { address, info: info.map(into_reth_acc) },
+        //     )?;
+        //     //}
+        // }
 
         Ok(())
     }
