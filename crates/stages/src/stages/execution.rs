@@ -116,7 +116,7 @@ impl<EF: ExecutorFactory> ExecutionStage<EF> {
         provider: &DatabaseProviderRW<'_, &DB>,
         input: ExecInput,
     ) -> Result<ExecOutput, StageError> {
-        if let Some((state, output)) = self.state_to_write.take() {
+        if let Some((mut state, output)) = self.state_to_write.take() {
             info!(target: "sync::stages::execution", "WRITE STATE TO DB");
             //executor.stats().log_info();
             //drop(executor);
@@ -125,6 +125,21 @@ impl<EF: ExecutorFactory> ExecutionStage<EF> {
             let mut storage_changeset_cursor =
                 provider.tx_ref().cursor_dup_write::<tables::StorageChangeSet>()?;
             info!(target: "sync::stages::execution", "state len {}", state.len());
+
+            // state.sort_by(|a, b| {
+            //     let ret = a.0.cmp(&b.0);
+
+            //     if ret == std::cmp::Ordering::Equal {
+            //         let ret = a.1.key.cmp(&b.1.key);
+            //         if ret == std::cmp::Ordering::Equal {
+            //             panic!("Duplicate storage entry on {a:?} and {b:?}");
+            //         };
+            //         ret
+            //     } else {
+            //         ret
+            //     }
+            // });
+
             for (entry_key, entry_value) in state {
                 storage_changeset_cursor.append_dup(entry_key, entry_value)?;
             }
@@ -369,7 +384,6 @@ impl<EF: ExecutorFactory, DB: Database> Stage<DB> for ExecutionStage<EF> {
         // to optimize revm or move data to the heap.
         //
         // See https://github.com/bluealloy/revm/issues/305
-        tokio::time::sleep(Duration::from_secs(5)).await;
         self.execute_inner(provider, input)
         // std::thread::scope(|scope| {
         //     let handle = std::thread::Builder::new()

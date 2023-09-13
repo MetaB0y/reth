@@ -398,13 +398,12 @@ impl From<PlainStateReverts> for StateReverts {
 }
 
 impl StateReverts {
-
     #[inline(never)]
     pub fn wrapper<'a, TX: DbTxMut<'a> + DbTx<'a>>(
         mut self,
         tx: &TX,
         first_block: BlockNumber,
-    ) -> Result<Vec<(BlockNumberAddress,StorageEntry)>, DatabaseError> {
+    ) -> Result<Vec<(BlockNumberAddress, StorageEntry)>, DatabaseError> {
         let mut output = {
             // Transmute the  reverts so they are more packed.
             std::mem::take(&mut self.0.accounts);
@@ -475,6 +474,19 @@ impl StateReverts {
                             },
                         ));
                     }
+                    output.sort_by(|a, b| {
+                        let ret = a.0.cmp(&b.0);
+
+                        if ret == std::cmp::Ordering::Equal {
+                            let ret = a.1.key.cmp(&b.1.key);
+                            if ret == std::cmp::Ordering::Equal {
+                                panic!("Duplicate storage entry on {a:?} and {b:?}");
+                            };
+                            ret
+                        } else {
+                            ret
+                        }
+                    });
                 } else {
                     // if there is some of wiped storage, they are both sorted, intersect both of
                     // them and in conflict use change from revert (discard values from wiped
@@ -537,12 +549,25 @@ impl StateReverts {
                             StorageEntry { key: H256(apply.0.to_be_bytes()), value: apply.1 },
                         ));
                     }
+                    // SORT IT
+                    // output.sort_by(|a, b| {
+                    //     let ret = a.0.cmp(&b.0);
+
+                    //     if ret == std::cmp::Ordering::Equal {
+                    //         let ret = a.1.key.cmp(&b.1.key);
+                    //         if ret == std::cmp::Ordering::Equal {
+                    //             panic!("Duplicate storage entry on {a:?} and {b:?}");
+                    //         };
+                    //         ret
+                    //     } else {
+                    //         ret
+                    //     }
+                    // });
                 }
                 //}
             }
             output
         };
-
 
         Ok(output)
     }
